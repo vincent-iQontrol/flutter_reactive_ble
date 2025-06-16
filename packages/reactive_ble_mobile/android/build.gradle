@@ -38,6 +38,7 @@ apply plugin: "io.gitlab.arturbosch.detekt"
 apply plugin: "de.mannodermaus.android-junit5"
 
 android {
+    namespace 'com.signify.hue.flutterreactiveble'
     compileSdkVersion 31
     sourceSets {
         main.java.srcDirs += 'src/main/kotlin'
