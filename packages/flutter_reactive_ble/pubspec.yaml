@@ -26,7 +26,7 @@ dependencies:
     git:
       url: https://github.com/vincent-iQontrol/flutter_reactive_ble.git
       path: packages/reactive_ble_mobile
-      ref: master
+      ref: bluetooth_permissions
 
   reactive_ble_platform_interface: 5.0.2
 dev_dependencies:
