@@ -14,21 +14,19 @@ import io.reactivex.disposables.Disposable
 import io.reactivex.functions.Function
 import io.reactivex.subjects.BehaviorSubject
 import java.util.concurrent.TimeUnit
-
-// added
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.Context
 import android.content.BroadcastReceiver
 import android.bluetooth.BluetoothDevice
-import android.os.Build
 
 internal class DeviceConnector(
     private val device: RxBleDevice,
     private val context: Context,
     private val connectionTimeout: Duration,
     private val updateListeners: (update: ConnectionUpdate) -> Unit,
-    private val connectionQueue: ConnectionQueue
+    private val connectionQueue: ConnectionQueue,
+    private val shouldBond: Boolean // <- nieuw: vanuit Flutter meegegeven
 ) {
 
     companion object {
@@ -44,8 +42,7 @@ internal class DeviceConnector(
     internal var connectionDisposable: Disposable? = null
 
     private val lazyConnection = lazy {
-        prepareConnection(device) // TODO test
-        //connectionDisposable = establishConnection(device)
+        prepareConnection(device)
         connectDeviceSubject
     }
 
@@ -59,8 +56,7 @@ internal class DeviceConnector(
             .startWith(device.connectionState)
             .map<ConnectionUpdate> { ConnectionUpdateSuccess(device.macAddress, it.toConnectionState().code) }
             .onErrorReturn {
-                ConnectionUpdateError(device.macAddress, it.message
-                    ?: "Unknown error")
+                ConnectionUpdateError(device.macAddress, it.message ?: "Unknown error")
             }
             .subscribe {
                 updateListeners.invoke(it)
@@ -69,16 +65,11 @@ internal class DeviceConnector(
 
     private var bondReceiverRegistered: Boolean = false
 
-
     internal fun disconnectDevice(deviceId: String) {
         val diff = System.currentTimeMillis() - timestampEstablishConnection
 
-        /*
-        in order to prevent Android from ignoring disconnects we add a delay when we try to
-        disconnect to quickly after establishing connection. https://issuetracker.google.com/issues/37121223
-         */
-        if (diff < DeviceConnector.Companion.minTimeMsBeforeDisconnectingIsAllowed) {
-            Single.timer(DeviceConnector.Companion.minTimeMsBeforeDisconnectingIsAllowed - diff, TimeUnit.MILLISECONDS)
+        if (diff < minTimeMsBeforeDisconnectingIsAllowed) {
+            Single.timer(minTimeMsBeforeDisconnectingIsAllowed - diff, TimeUnit.MILLISECONDS)
                 .doFinally {
                     sendDisconnectedUpdate(deviceId)
                     disposeSubscriptions()
@@ -95,34 +86,40 @@ internal class DeviceConnector(
 
     private fun disposeSubscriptions() {
         connectionDisposable?.dispose()
+        if (bondReceiverRegistered) {
+            context.unregisterReceiver(bondStateReceiver)
+            bondReceiverRegistered = false
+        }
         connectDeviceSubject.onComplete()
         connectionStatusUpdates.dispose()
     }
 
     private val bondStateReceiver: BroadcastReceiver = object : BroadcastReceiver() {
-
         override fun onReceive(context: Context, intent: Intent) {
-
-            val action: String? = intent.getAction()
-            if (action.equals(BluetoothDevice.ACTION_BOND_STATE_CHANGED)) {
-                val state: Int =
-                    intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR)
+            val action: String? = intent.action
+            if (action == BluetoothDevice.ACTION_BOND_STATE_CHANGED) {
+                val state = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR)
                 when (state) {
                     BluetoothDevice.BOND_BONDED -> {
-                        //setBonded(true)
-                        println("BtleConManager bonded lets make a connection")
-                        connectionDisposable = establishConnection(device)
+                        println("BtleConManager bonded, establishing connection")
+                        if (!bondReceiverRegistered) return
+                        context.unregisterReceiver(this)
+                        bondReceiverRegistered = false
+
+                        if (connectionDisposable == null || connectionDisposable?.isDisposed == true) {
+                            connectionDisposable = establishConnection(device)
+                        }
                     }
-                    BluetoothDevice.BOND_BONDING -> println("BtleConManager bonding")
+                    BluetoothDevice.BOND_BONDING -> println("BtleConManager bonding...")
                     BluetoothDevice.BOND_NONE -> {
-                        println("BtleConManager unbonded")
-                        //setBonded(false)
-                        val prevState: Int = intent.getIntExtra(
+                        println("BtleConManager bond failed or removed")
+                        val prevState = intent.getIntExtra(
                             BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE,
                             BluetoothDevice.ERROR
                         )
                         if (prevState == BluetoothDevice.BOND_BONDING) {
-                            //
+                            context.unregisterReceiver(this)
+                            bondReceiverRegistered = false
                         }
                     }
                 }
@@ -133,47 +130,40 @@ internal class DeviceConnector(
     private fun prepareConnection(rxBleDevice: RxBleDevice) {
         println("prepareConnection: start")
 
-        // Only create a bond when timeout = 25 second or 8 seconds and if device is not bonded
-        if (rxBleDevice.bluetoothDevice.bondState === BluetoothDevice.BOND_NONE && (Duration(25000, TimeUnit.MILLISECONDS).equals(connectionTimeout) || Duration(8000, TimeUnit.MILLISECONDS).equals(connectionTimeout))) {
-            println("prepareConnection: no bond, create one and wait")
+        if (shouldBond && rxBleDevice.bluetoothDevice.bondState == BluetoothDevice.BOND_NONE) {
+            println("prepareConnection: no bond, creating bond and waiting")
             val filter = IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
             context.registerReceiver(bondStateReceiver, filter)
-            rxBleDevice.getBluetoothDevice().createBond()
-        }
-        else {
-            println("prepareConnection: just establishConnection")
+            bondReceiverRegistered = true
+            rxBleDevice.bluetoothDevice.createBond()
+        } else {
+            println("prepareConnection: skipping bond, connecting directly")
             connectionDisposable = establishConnection(rxBleDevice)
         }
     }
 
     private fun establishConnection(rxBleDevice: RxBleDevice): Disposable {
-
         val deviceId = rxBleDevice.macAddress
-
         val shouldNotTimeout = connectionTimeout.value <= 0L
+
         connectionQueue.addToQueue(deviceId)
         updateListeners(ConnectionUpdateSuccess(deviceId, ConnectionState.CONNECTING.code))
 
         return waitUntilFirstOfQueue(deviceId)
             .switchMap { queue ->
                 if (!queue.contains(deviceId)) {
-                    Observable.just(EstablishConnectionFailure(deviceId,
-                        "Device is not in queue"))
+                    Observable.just(EstablishConnectionFailure(deviceId, "Device is not in queue"))
                 } else {
-
-
-
                     connectDevice(rxBleDevice, shouldNotTimeout)
-                        .map<EstablishConnectionResult> { EstablishedConnection(rxBleDevice.macAddress, it) }
+                        .map<EstablishConnectionResult> {
+                            EstablishedConnection(rxBleDevice.macAddress, it)
+                        }
                 }
             }
             .onErrorReturn { error ->
-                EstablishConnectionFailure(rxBleDevice.macAddress,
-                    error.message ?: "Unknown error")
+                EstablishConnectionFailure(rxBleDevice.macAddress, error.message ?: "Unknown error")
             }
             .doOnNext {
-                // Trigger side effect by calling the lazy initialization of this property so
-                // listening to changes starts.
                 connectionStatusUpdates
                 timestampEstablishConnection = System.currentTimeMillis()
                 connectionQueue.removeFromQueue(deviceId)
@@ -183,27 +173,20 @@ internal class DeviceConnector(
             }
             .doOnError {
                 connectionQueue.removeFromQueue(deviceId)
-                updateListeners.invoke(ConnectionUpdateError(deviceId, it.message
-                    ?: "Unknown error"))
+                updateListeners.invoke(ConnectionUpdateError(deviceId, it.message ?: "Unknown error"))
             }
             .subscribe({ connectDeviceSubject.onNext(it) },
                 { throwable -> connectDeviceSubject.onError(throwable) })
     }
 
     private fun connectDevice(rxBleDevice: RxBleDevice, shouldNotTimeout: Boolean): Observable<RxBleConnection> =
-        rxBleDevice.establishConnection(shouldNotTimeout)
-            .compose {
-                if (shouldNotTimeout) {
-                    it
-                } else {
-                    it.timeout(
-                        Observable.timer(connectionTimeout.value, connectionTimeout.unit),
-                        Function<RxBleConnection, Observable<Unit>> {
-                            Observable.never<Unit>()
-                        }
-                    )
-                }
-            }
+        rxBleDevice.establishConnection(shouldNotTimeout).compose {
+            if (shouldNotTimeout) it
+            else it.timeout(
+                Observable.timer(connectionTimeout.value, connectionTimeout.unit),
+                Function<RxBleConnection, Observable<Unit>> { Observable.never() }
+            )
+        }
 
     internal fun clearGattCache(): Completable = currentConnection?.let { connection ->
         when (connection) {
@@ -212,17 +195,6 @@ internal class DeviceConnector(
         }
     } ?: Completable.error(IllegalStateException("Connection is not established"))
 
-    /**
-     * Clear GATT attribute cache using an undocumented method `BluetoothGatt.refresh()`.
-     *
-     * May trigger the following warning in the system message log:
-     *
-     * https://android.googlesource.com/platform/frameworks/base/+/pie-release/config/hiddenapi-light-greylist.txt
-     *
-     *     Accessing hidden method Landroid/bluetooth/BluetoothGatt;->refresh()Z (light greylist, reflection)
-     *
-     * Known to work up to Android Q beta 2.
-     */
     private fun clearGattCache(connection: RxBleConnection): Completable {
         val operation = RxBleCustomOperation<Unit> { bluetoothGatt, _, _ ->
             try {
@@ -230,10 +202,9 @@ internal class DeviceConnector(
                 val success = refreshMethod.invoke(bluetoothGatt) as Boolean
                 if (success) {
                     Observable.empty<Unit>()
-                        .delay(DeviceConnector.Companion.delayMsAfterClearingCache, TimeUnit.MILLISECONDS)
+                        .delay(delayMsAfterClearingCache, TimeUnit.MILLISECONDS)
                 } else {
-                    val reason = "BluetoothGatt.refresh() returned false"
-                    Observable.error(RuntimeException(reason))
+                    Observable.error(RuntimeException("BluetoothGatt.refresh() returned false"))
                 }
             } catch (e: ReflectiveOperationException) {
                 Observable.error<Unit>(e)
